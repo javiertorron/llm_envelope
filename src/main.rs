@@ -48,15 +48,28 @@ fn main() {
         return;
     }
 
-    // 1. Convertimos texto a tokens (Encode)
+    // 1. Convertimos texto a tokens de entrada (Prompt)
     match tokenizer.encode(prompt) {
-        Ok(tokens) => {
-            println!("📥 Prompt tokenizado (IDs): {:?}", tokens);
+        Ok(prompt_tokens) => {
+            let prompt_tokens_count = prompt_tokens.len();
+            println!("📥 Prompt tokenizado (IDs): {:?}", prompt_tokens);
+            
+            // [AQUÍ IRÁ LA INFERENCIA DEL LLM EN EL FUTURO]
+            // Simulamos que el LLM genera unos tokens de respuesta (ahora mismo, repetimos el prompt para probar el decoder)
+            let generated_tokens = prompt_tokens.clone();
+            let generated_tokens_count = generated_tokens.len();
 
-            // 2. Convertimos tokens de vuelta a texto (Decode)
-            match tokenizer.decode(&tokens) {
+            // 2. Convertimos tokens generados de vuelta a texto (Decode)
+            match tokenizer.decode(&generated_tokens) {
                 Ok(decoded_text) => {
                     println!("📤 Texto restaurado (Decode): {}", decoded_text);
+                    
+                    // 3. Contabilidad total de uso para facturación/tasas
+                    let total_tokens_used = prompt_tokens_count + generated_tokens_count;
+                    println!("\n📊 --- REPORTE DE USO ---");
+                    println!("   Tokens de Entrada (Prompt): {}", prompt_tokens_count);
+                    println!("   Tokens de Salida (Generados): {}", generated_tokens_count);
+                    println!("   Total de Tokens a facturar: {}", total_tokens_used);
                 }
                 Err(e) => eprintln!("❌ Error al decodificar los tokens: {}", e),
             }
@@ -64,4 +77,3 @@ fn main() {
         Err(e) => eprintln!("❌ Error al codificar el prompt: {}", e),
     }
 }
-
