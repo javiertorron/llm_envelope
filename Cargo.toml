@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle-core = "0.10.2"
+candle-core = { version = "0.10.2" }
+candle-datasets = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = { version = "0.10.2" }
+hf-hub = "0.5.0"
+tokenizers = "0.23.1"
