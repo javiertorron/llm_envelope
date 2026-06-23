@@ -172,6 +172,8 @@ pub struct GemmaAttention {
     k_proj: Linear,
     v_proj: Option<Linear>,
     o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -208,12 +210,17 @@ impl GemmaAttention {
         };
         
         let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+        
+        let q_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
 
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             num_kv_groups,
@@ -242,13 +249,13 @@ impl GemmaAttention {
             None => key_states.clone(),
         };
 
-        // 2. Reformatear para atención (batch_size, num_heads, seq_len, head_dim)
-        let query_states = query_states
-            .reshape((b_sz, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = key_states
-            .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // 2. Reformatear para atención y normalizar por cabezal (b_sz, seq_len, num_heads, head_dim)
+        let query_states = query_states.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        
+        let key_states = key_states.reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        
         let value_states = value_states
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -316,6 +323,9 @@ pub struct DecoderLayer {
     mlp: GemmaMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    pre_feedforward_layernorm: RmsNorm,
+    post_feedforward_layernorm: RmsNorm,
+    layer_scalar: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -325,18 +335,37 @@ impl DecoderLayer {
         let input_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
         
-        Ok(Self { self_attn, mlp, input_layernorm, post_attention_layernorm })
+        let pre_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("pre_feedforward_layernorm"))?;
+        let post_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("post_feedforward_layernorm"))?;
+        
+        // layer_scalar se encuentra en algunas arquitecturas como gemma4/2
+        let layer_scalar = vb.get(1, "layer_scalar").ok();
+        
+        Ok(Self { 
+            self_attn, mlp, input_layernorm, post_attention_layernorm, 
+            pre_feedforward_layernorm, post_feedforward_layernorm, layer_scalar 
+        })
     }
 
     pub fn forward(&self, x: &Tensor, rotary_emb: &RotaryEmbedding, seqlen_offset: usize) -> Result<Tensor> {
         let residual = x.clone();
-        let x = self.input_layernorm.forward(x)?;
+        let x = self.input_layernorm.forward(&x)?;
         let x = self.self_attn.forward(&x, rotary_emb, seqlen_offset)?;
+        let mut x = self.post_attention_layernorm.forward(&x)?;
+        
+        if let Some(scalar) = &self.layer_scalar {
+            x = x.broadcast_mul(scalar)?;
+        }
         let x = (x + residual)?;
         
         let residual = x.clone();
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.pre_feedforward_layernorm.forward(&x)?;
         let x = self.mlp.forward(&x)?;
+        let mut x = self.post_feedforward_layernorm.forward(&x)?;
+        
+        if let Some(scalar) = &self.layer_scalar {
+            x = x.broadcast_mul(scalar)?;
+        }
         x + residual
     }
 }
