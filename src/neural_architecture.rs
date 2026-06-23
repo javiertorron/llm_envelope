@@ -27,6 +27,10 @@ impl CpuLinear {
     
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = self.inner.weight();
+        let w = match x.dims() {
+            &[bsize, _, _] => w.broadcast_left(bsize)?,
+            _ => w.clone(),
+        };
         let mut out = matmul_bf16(x, &w.t()?)?;
         if let Some(bias) = self.inner.bias() {
             out = out.broadcast_add(bias)?;
@@ -481,6 +485,10 @@ impl Gemma4Model {
     /// Proyecta el hidden state final en logits usando los pesos del embedding original (tie_word_embeddings = true)
     pub fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let embeddings = self.embed_tokens.embeddings();
-        crate::neural_architecture::matmul_bf16(hidden_states, &embeddings.t()?)
+        let w = match hidden_states.dims() {
+            &[bsize, _, _] => embeddings.broadcast_left(bsize)?,
+            _ => embeddings.clone(),
+        };
+        crate::neural_architecture::matmul_bf16(hidden_states, &w.t()?)
     }
 }
