@@ -140,8 +140,7 @@ pub struct CustomConfig {
 
 pub struct EnvelopeLlm {
     pub config: ModelConfig,
-    // La arquitectura del modelo (Gemma) vendrá aquí pronto.
-    // pub model: Gemma4Unified,
+    pub model: crate::neural_architecture::Gemma4Model,
 }
 
 impl EnvelopeLlm {
@@ -209,9 +208,12 @@ impl EnvelopeLlm {
             VarBuilder::from_mmaped_safetensors(&safetensor_files, DType::BF16, &device)?
         };
 
-        println!("✅ Memoria virtual mapeada correctamente. El modelo está listo para ser instanciado.");
+        println!("🏗️ Instanciando red neuronal Gemma4Unified en RAM virtual...");
+        // Pasamos _vb.pp("model.language_model") porque todos los tensores cuelgan de esa raíz.
+        let model = crate::neural_architecture::Gemma4Model::load(_vb.pp("model").pp("language_model"), &config.text_config, &device)?;
+        println!("✅ Memoria virtual mapeada y arquitectura ensamblada. El modelo está listo para inferir.");
 
-        Ok(Self { config })
+        Ok(Self { config, model })
     }
 
     /// Genera la respuesta del modelo recibiendo los tokens del prompt

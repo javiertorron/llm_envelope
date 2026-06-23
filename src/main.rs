@@ -5,6 +5,7 @@ use std::process;
 mod environment;
 mod llm;
 mod tokenizer;
+pub mod neural_architecture;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Candle LLM Inference Envelope")]
