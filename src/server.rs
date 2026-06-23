@@ -78,7 +78,7 @@ async fn chat_completions(
         .map(|m| format!("<start_of_turn>{}\n{}<end_of_turn>\n", m.role, m.content))
         .collect::<String>() + "<start_of_turn>model\n";
     
-    let mut tokenizer = state.tokenizer.lock().unwrap().clone();
+    let tokenizer = state.tokenizer.lock().unwrap().clone();
     let prompt_tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
     
     let temperature = req.temperature.unwrap_or(0.0);

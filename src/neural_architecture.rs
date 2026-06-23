@@ -1,6 +1,6 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Module, VarBuilder};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Helper de multiplicación de matrices que soporta BF16 en CPU
 pub fn matmul_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -114,7 +114,7 @@ impl KVCache {
         }
     }
 }
-use candle_nn::{linear_no_bias, Linear};
+use candle_nn::linear_no_bias;
 use crate::llm::{TextConfig, RopeAttentionConfig};
 
 /// RoPE (Rotary Position Embeddings)

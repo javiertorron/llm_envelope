@@ -13,6 +13,10 @@ struct Args {
     /// Ruta absoluta al directorio del modelo (opcional)
     #[arg(long = "model")]
     model: Option<PathBuf>,
+
+    /// Arranca el servidor HTTP en lugar de usar la consola interactiva
+    #[arg(long = "serve", default_value_t = false)]
+    serve: bool,
 }
 
 pub mod server;
@@ -48,12 +52,54 @@ async fn main() {
         }
     };
 
-    // Preparamos el AppState
-    let state = std::sync::Arc::new(server::AppState {
-        llm: std::sync::Arc::new(llm),
-        tokenizer: std::sync::Arc::new(std::sync::Mutex::new(tokenizer.inner)),
-    });
+    if args.serve {
+        // Preparamos el AppState
+        let state = std::sync::Arc::new(server::AppState {
+            llm: std::sync::Arc::new(llm),
+            tokenizer: std::sync::Arc::new(std::sync::Mutex::new(tokenizer.inner)),
+        });
 
-    // Arrancamos el servidor
-    server::start_server(state, 8080).await;
+        // Arrancamos el servidor
+        server::start_server(state, 8080).await;
+    } else {
+        // Modo Consola Interactiva
+        
+        loop {
+            print!("\n🧑‍💻 Prompt: ");
+            io::stdout().flush().unwrap();
+            
+            let mut prompt = String::new();
+            if io::stdin().read_line(&mut prompt).is_err() || prompt.trim().is_empty() {
+                continue;
+            }
+            
+            let prompt = prompt.trim();
+            if prompt == "exit" || prompt == "quit" {
+                break;
+            }
+            
+            println!("🤖 Respuesta:");
+            let prompt_tokens = match tokenizer.encode(prompt) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error al tokenizar: {}", e);
+                    continue;
+                }
+            };
+            
+            // max_tokens = 512 por defecto en consola, con temperatura estándar
+            let _ = llm.generate(&prompt_tokens, 0.7, 512, |token_id| {
+                if let Ok(text) = tokenizer.decode(&[token_id]) {
+                    print!("{}", text);
+                    io::stdout().flush().unwrap();
+                }
+                Ok(())
+            });
+            
+            println!();
+            
+            // Limpiar caché para el siguiente prompt
+            llm.model.clear_kv_cache();
+        }
+    }
 }
