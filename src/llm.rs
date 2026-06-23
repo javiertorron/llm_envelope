@@ -216,10 +216,70 @@ impl EnvelopeLlm {
         Ok(Self { config, model })
     }
 
-    /// Genera la respuesta del modelo recibiendo los tokens del prompt
-    pub fn generate(&self, _prompt_tokens: &[u32]) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
-        // Lógica futura de inferencia paso a paso
-        Ok(Vec::new())
+    /// Genera la respuesta del modelo procesando los tokens de entrada y produciendo nuevos autorregresivamente.
+    pub fn generate<F>(
+        &self,
+        prompt_tokens: &[u32],
+        temperature: f64,
+        max_tokens: usize,
+        mut on_token: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    {
+        use candle_transformers::generation::LogitsProcessor;
+        use candle_core::IndexOp;
+
+        // 1. Limpiar Caché KV de ejecuciones anteriores
+        self.model.clear_kv_cache();
+
+        let device = &candle_core::Device::Cpu;
+        let mut logits_processor = LogitsProcessor::new(299792458, Some(temperature), None);
+
+        let mut tokens = prompt_tokens.to_vec();
+
+        for index in 0..max_tokens {
+            let context_size = if index == 0 { tokens.len() } else { 1 };
+            let start_pos = if index == 0 { 0 } else { tokens.len() - 1 };
+
+            // Construir tensor de entrada: [1, seq_len]
+            let input_slice = &tokens[start_pos..start_pos + context_size];
+            let input_tensor = candle_core::Tensor::new(input_slice, device)?.unsqueeze(0)?;
+
+            // Pase hacia adelante (Forward Pass)
+            let hidden_states = self.model.forward(&input_tensor, start_pos)?;
+
+            // Obtener el último estado oculto: (1, seq_len, hidden_size) -> (1, hidden_size)
+            let last_hidden = hidden_states.i((0, context_size - 1))?.unsqueeze(0)?;
+
+            // Calcular logits finales (LM Head)
+            let mut final_logits = self.model.lm_head(&last_hidden)?.squeeze(0)?; // (vocab_size)
+
+            // Convertir a f32 para Softcapping y Muestreo
+            final_logits = final_logits.to_dtype(candle_core::DType::F32)?;
+
+            // Softcapping (Gemma 4 usa 30.0 por defecto)
+            let softcap = self.config.text_config.final_logit_softcapping as f64;
+            if softcap > 0.0 {
+                final_logits = ((final_logits / softcap)?.tanh()? * softcap)?;
+            }
+
+            // Muestreo probabilístico (Temperature / Top-K integrados en el LogitsProcessor)
+            let next_token = logits_processor.sample(&final_logits)?;
+            
+            println!("[DEBUG] iter={}, next_token={}", index, next_token);
+
+            tokens.push(next_token);
+            on_token(next_token)?;
+
+            // Condición de Parada
+            if next_token == self.config.text_config.eos_token_id {
+                println!("[DEBUG] EOS alcanzado.");
+                break;
+            }
+        }
+
+        Ok(())
     }
 }
 

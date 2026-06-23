@@ -2,6 +2,39 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use std::sync::{Arc, Mutex};
 
+/// Helper de multiplicación de matrices que soporta BF16 en CPU
+pub fn matmul_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.dtype() == DType::BF16 && a.device().is_cpu() {
+        let a_f32 = a.to_dtype(DType::F32)?;
+        let b_f32 = b.to_dtype(DType::F32)?;
+        let res = a_f32.matmul(&b_f32)?;
+        res.to_dtype(DType::BF16)
+    } else {
+        a.matmul(b)
+    }
+}
+
+/// Envoltorio sobre candle_nn::Linear que usa matmul_bf16
+#[derive(Debug)]
+pub struct CpuLinear {
+    inner: candle_nn::Linear,
+}
+
+impl CpuLinear {
+    pub fn new(inner: candle_nn::Linear) -> Self {
+        Self { inner }
+    }
+    
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let w = self.inner.weight();
+        let mut out = matmul_bf16(x, &w.t()?)?;
+        if let Some(bias) = self.inner.bias() {
+            out = out.broadcast_add(bias)?;
+        }
+        Ok(out)
+    }
+}
+
 /// Normalización Root Mean Square (RMSNorm) exclusiva para la arquitectura Gemma.
 /// A diferencia del estándar, Gemma suma 1.0 a los pesos aprendidos de forma matemática.
 #[derive(Debug)]
@@ -51,6 +84,12 @@ impl KVCache {
         Self { k: None, v: None }
     }
 
+    /// Limpia la caché para iniciar una nueva generación independiente
+    pub fn clear(&mut self) {
+        self.k = None;
+        self.v = None;
+    }
+
     /// Actualiza la caché adjuntando (concatenando) los nuevos tensores K y V generados.
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         match (&self.k, &self.v) {
@@ -70,13 +109,7 @@ impl KVCache {
             }
         }
     }
-
-    pub fn clear(&mut self) {
-        self.k = None;
-        self.v = None;
-    }
 }
-
 use candle_nn::{linear_no_bias, Linear};
 use crate::llm::{TextConfig, RopeAttentionConfig};
 
@@ -126,9 +159,9 @@ impl RotaryEmbedding {
 /// Multi-Layer Perceptron (GemmaMLP)
 #[derive(Debug)]
 pub struct GemmaMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: CpuLinear,
+    up_proj: CpuLinear,
+    down_proj: CpuLinear,
 }
 
 impl GemmaMlp {
@@ -136,9 +169,9 @@ impl GemmaMlp {
         let hidden_size = config.hidden_size;
         let intermediate_size = config.intermediate_size;
         
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        let gate_proj = CpuLinear::new(candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?);
+        let up_proj = CpuLinear::new(candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?);
+        let down_proj = CpuLinear::new(candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?);
         Ok(Self { gate_proj, up_proj, down_proj })
     }
 
@@ -168,10 +201,10 @@ fn repeat_kv(x: Tensor, num_key_value_groups: usize) -> Result<Tensor> {
 /// Capa de Atención (GemmaAttention) con soporte GQA, caché y ventana deslizante
 #[derive(Debug)]
 pub struct GemmaAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Option<Linear>,
-    o_proj: Linear,
+    q_proj: CpuLinear,
+    k_proj: CpuLinear,
+    v_proj: Option<CpuLinear>,
+    o_proj: CpuLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -199,17 +232,17 @@ impl GemmaAttention {
         };
         let num_kv_groups = num_heads / num_kv_heads;
 
-        let q_proj = linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?;
+        let q_proj = CpuLinear::new(linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?);
+        let k_proj = CpuLinear::new(linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?);
         
         // Si is_sliding, existe v_proj. Si no, K=V (attention_k_eq_v) y no hay v_proj.
         let v_proj = if is_sliding {
-            Some(linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?)
+            Some(CpuLinear::new(linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?))
         } else {
             None
         };
         
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+        let o_proj = CpuLinear::new(linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?);
         
         let q_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
@@ -276,7 +309,7 @@ impl GemmaAttention {
 
         // 6. Dot-product attention pura
         let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+        let attn_weights = (crate::neural_architecture::matmul_bf16(&query_states, &key_states.transpose(2, 3)?)? * scale)?;
 
         // 7. Enmascaramiento condicional (sólo para prompt processing o ventanas grandes)
         let attn_weights = if seq_len > 1 {
@@ -288,7 +321,7 @@ impl GemmaAttention {
         };
 
         // 8. Multiplicar por V y ensamblar
-        let attn_output = attn_weights.matmul(&value_states)?;
+        let attn_output = crate::neural_architecture::matmul_bf16(&attn_weights, &value_states)?;
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
@@ -313,6 +346,11 @@ impl GemmaAttention {
             .collect();
         let mask = Tensor::from_vec(mask, (seq_len, kv_len), device)?;
         mask.unsqueeze(0)?.unsqueeze(0)?.to_dtype(dtype)
+    }
+
+    pub fn clear_kv_cache(&self) {
+        let mut cache = self.kv_cache.lock().unwrap();
+        cache.clear();
     }
 }
 
@@ -367,6 +405,10 @@ impl DecoderLayer {
             x = x.broadcast_mul(scalar)?;
         }
         x + residual
+    }
+
+    pub fn clear_kv_cache(&self) {
+        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -427,5 +469,18 @@ impl Gemma4Model {
         }
         
         self.norm.forward(&x)
+    }
+
+    /// Limpia el estado de la caché KV para preparar al modelo para un nuevo prompt
+    pub fn clear_kv_cache(&self) {
+        for layer in &self.layers {
+            layer.clear_kv_cache();
+        }
+    }
+
+    /// Proyecta el hidden state final en logits usando los pesos del embedding original (tie_word_embeddings = true)
+    pub fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let embeddings = self.embed_tokens.embeddings();
+        crate::neural_architecture::matmul_bf16(hidden_states, &embeddings.t()?)
     }
 }
