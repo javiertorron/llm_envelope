@@ -140,7 +140,8 @@ pub struct CustomConfig {
 
 pub struct EnvelopeLlm {
     pub config: ModelConfig,
-    // TODO: Añadir aquí los componentes internos (ej: candle_core::Tensor)
+    // La arquitectura del modelo (Gemma) vendrá aquí pronto.
+    // pub model: Gemma4Unified,
 }
 
 impl EnvelopeLlm {
@@ -172,6 +173,43 @@ impl EnvelopeLlm {
         }
         
         println!("✅ Configuración estricta del LLM cargada correctamente.");
+
+        // === FASE DE MEMORY MAPPING (mmap) ===
+        use candle_core::{DType, Device};
+        use candle_nn::VarBuilder;
+        use std::path::PathBuf;
+
+        // 1. Recolectar todos los archivos .safetensors en el directorio
+        let mut safetensor_files: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(base_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "safetensors" {
+                        safetensor_files.push(path);
+                    }
+                }
+            }
+        }
+
+        if safetensor_files.is_empty() {
+            return Err("No se encontraron archivos .safetensors en el directorio base.".into());
+        }
+        // Ordenarlos alfabéticamente para asegurar que se mapeen en orden (00001, 00002...)
+        safetensor_files.sort();
+
+        // 2. Establecemos el dispositivo y la precisión
+        // Por autonomía e independencia, forzamos CPU. Gemma usa BF16 de forma nativa.
+        let device = Device::Cpu;
+        println!("⏳ Mapeando {} archivos safetensors (mmap) en memoria virtual...", safetensor_files.len());
+
+        // 3. Crear el VarBuilder con memory mapping (unsafe porque el SO asume que nadie borrará los archivos mientras corre)
+        let _vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&safetensor_files, DType::BF16, &device)?
+        };
+
+        println!("✅ Memoria virtual mapeada correctamente. El modelo está listo para ser instanciado.");
 
         Ok(Self { config })
     }
