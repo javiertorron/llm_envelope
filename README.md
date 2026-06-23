@@ -1,16 +1,17 @@
-# Candle LLM Inference Envelope 🦀🚀
+# Candle LLM Inference Envelope (Gemma 4 12b) 🦀🚀
 
-Un motor y servidor de inferencia para Modelos de Lenguaje Grande (LLMs) empaquetado en un único ejecutable autónomo y portable, desarrollado 100% en Rust utilizando el framework **Candle** de Hugging Face.
+Un motor y servidor de inferencia para Modelos de Lenguaje Grande (LLMs) empaquetado en un único ejecutable autónomo y portable, desarrollado 100% en Rust utilizando el framework **Candle** de Hugging Face. **Este envoltorio ha sido diseñado de manera estricta y exclusiva para el modelo Gemma 4 de 12b parámetros.**
 
 ## 📋 Descripción del Proyecto
 
-Este proyecto redefine la distribución de modelos de Inteligencia Artificial mediante el patrón **Model-as-a-Service (MaaS)** en local. A diferencia de las soluciones tradicionales basadas en entornos pesados de Python, este sistema compila todo el ciclo de vida de la inferencia (Tokenización, Carga de Tensores, Procesamiento de Matrices y Servidor API HTTP) dentro de un único binario nativo, optimizado, portable y sin dependencias dinámicas.
+Este proyecto redefine la distribución de modelos de Inteligencia Artificial mediante el patrón **Model-as-a-Service (MaaS)** en local. A diferencia de las soluciones genéricas, este envelope está fuertemente acoplado a la arquitectura de **Gemma 4 12b**, garantizando que cada campo de configuración del archivo JSON y cada tensor sean exactamente los esperados sin tolerar desviaciones. Compila todo el ciclo de vida de la inferencia (Tokenización, Carga de Tensores, Procesamiento de Matrices y Servidor API HTTP) dentro de un único binario nativo, optimizado, portable y sin dependencias dinámicas.
 
 El desarrollo se aborda de forma incremental siguiendo una metodología **Agile orientada a Épicas e Hitos Atómicos**, minimizando la parálisis por análisis y garantizando la robustez de cada capa antes de exponerla a la red.
 
 ## ✨ Características Principales
 
 - **Runtime 100% Nativo en Rust:** Construido sobre el ecosistema matemático de `candle-core` y `candle-transformers`.
+- **Exclusividad Gemma 4 12b:** Las estructuras de memoria, variables de `config.json` y operaciones de tensores se mapean milimétricamente al modelo objetivo, sin sobrecarga por abstracciones genéricas.
 - **Carga de Memoria Eficiente:** Uso de `Memory Mapping (mmap)` a través de `VarBuilder` para inicializar modelos binarios masivos de forma segura sin saturar la memoria RAM.
 - **Formato Safetensors:** Compatibilidad nativa con el estándar industrial seguro y veloz de Hugging Face (`.safetensors`).
 - **Arquitectura Asíncrona Extrema:** Servidor HTTP ligero basado en `Axum` y el runtime `Tokio`, diseñado para procesar peticiones en microsegundos y mantener un consumo de memoria plano y predecible.
@@ -21,7 +22,7 @@ El desarrollo se aborda de forma incremental siguiendo una metodología **Agile 
 Al ejecutar el binario, el sistema realiza estrictamente las siguientes fases:
 
 1. **Validación de Entorno:** Comprueba la existencia de `config.json`, `tokenizer.json` y `*.safetensors` en la ruta especificada.
-2. **Carga Inicial (Warm-up):** Parsea la configuración e inicializa los pesos del modelo en memoria mediante `mmap` **antes** de abrir cualquier puerto de red.
+2. **Carga Inicial (Warm-up):** Parsea estrictamente la configuración (verificando que es un Gemma 4) e inicializa los pesos del modelo en memoria mediante `mmap` **antes** de abrir cualquier puerto de red.
 3. **Inicialización de Red:** Levanta el servicio HTTP en el puerto designado (por defecto `8080`).
 4. **Interfaz Silenciosa:** Reporta por `stdout` únicamente los hitos críticos (estado de la carga con timestamps, IP/puerto de escucha, y registro básico de peticiones procesadas).
 
@@ -35,7 +36,7 @@ El servidor expone un endpoint compatible con el estándar de OpenAI para facili
 
 ```json
 {
-  "model": "string",
+  "model": "gemma-4-12b",
   "messages": [
     {
       "role": "user",
@@ -51,7 +52,7 @@ El servidor expone un endpoint compatible con el estándar de OpenAI para facili
 Se transmite un flujo de eventos `text/event-stream` enviando tokens individuales en tiempo real, finalizando con la señal `[DONE]`:
 
 ```json
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"phi3","choices":[{"index":0,"delta":{"content":"palabra"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gemma-4-12b","choices":[{"index":0,"delta":{"content":"palabra"},"finish_reason":null}]}
 ...
 data: [DONE]
 ```
@@ -66,7 +67,7 @@ El producto final garantiza un despliegue sin fricciones en entornos productivos
 
 ## 🗺️ Mapa de Ruta de Ingeniería (Épicas)
 
-1. **Épica 1: El Motor en Consola (Inferencia Local):** Construcción del núcleo matemático de Candle y el bucle autorregresivo. El modelo carga desde el disco duro y genera texto directamente en la terminal (CLI puro).
+1. **Épica 1: El Motor en Consola (Inferencia Local):** Construcción del núcleo matemático de Candle acoplado a la arquitectura Gemma 4 y el bucle autorregresivo. El modelo carga desde el disco duro y genera texto directamente en la terminal (CLI puro).
 2. **Épica 2: El Servidor Rígido (API Síncrona):** Integración de la fachada de red con Axum. El modelo se aloja como estado compartido concurrente (`std::sync::Arc`) y responde peticiones HTTP POST.
 3. **Épica 3: El Servidor Fluido (API en Streaming):** Integración de canales asíncronos (`tokio::sync::mpsc`) para emitir la respuesta en tiempo real a través de flujos SSE.
 4. **Épica 4: El Binario Autónomo (Compilación Estática):** Aplicación de LTO y compilación `musl` para generar el ejecutable portable final.
@@ -74,10 +75,10 @@ El producto final garantiza un despliegue sin fricciones en entornos productivos
 ## 🛠️ Requisitos Previos
 
 - **Rust Toolchain:** Versión estable más reciente (`rustup update`).
-- **Archivos del Modelo (Ej: Microsoft Phi-3 o equivalente < 3B Parámetros):**
-  - Archivo de vocabulario: `tokenizer.json`
-  - Archivo de hiperparámetros: `config.json`
-  - Pesos del modelo: `model.safetensors`
+- **Archivos del Modelo Gemma 4 12b:**
+  - Archivo de vocabulario: `tokenizer.json` y `tokenizer_config.json`
+  - Archivo de hiperparámetros estrictos: `config.json`
+  - Pesos del modelo: `model.safetensors` (u otros nombres generados por safetensors)
 
 ## 🚀 Progreso Actual e Instrucciones (Fase 1)
 
