@@ -2,8 +2,8 @@ use clap::Parser;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
-
 mod environment;
+mod llm;
 mod tokenizer;
 
 #[derive(Parser, Debug)]
@@ -26,6 +26,15 @@ fn main() {
         eprintln!("❌ Error crítico de validación de entorno: {}", e);
         process::exit(1);
     }
+
+    // Cargamos la configuración del LLM
+    let _llm = match llm::EnvelopeLlm::load(base_path) {
+        Ok(model) => model,
+        Err(e) => {
+            eprintln!("❌ Error crítico al cargar la configuración del modelo: {}", e);
+            process::exit(1);
+        }
+    };
 
     let tokenizer = match tokenizer::EnvelopeTokenizer::load(base_path) {
         Ok(tok) => tok,
