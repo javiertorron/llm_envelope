@@ -1,7 +1,20 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerConfig {
+    pub device_type: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            device_type: "cpu".to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,32 +158,37 @@ pub struct EnvelopeLlm {
 
 impl EnvelopeLlm {
     /// Inicializa y carga la configuración (y futuramente los pesos) a partir de la ruta base
-    pub fn load(base_path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load(
+        base_path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config_path = base_path.join("config.json");
-        
+
         let file = File::open(&config_path)?;
         let reader = BufReader::new(file);
-        
+
         // Transformamos el JSON de forma estricta. Fallará si hay un campo no contemplado.
         let mut config: ModelConfig = serde_json::from_reader(reader)?;
         let original_max_pos = config.text_config.max_position_embeddings;
-        
+
         // Sobreescritura opcional de parámetros (si existe config_custom.json)
         let custom_config_path = base_path.join("config_custom.json");
         if custom_config_path.exists() {
             let custom_file = File::open(&custom_config_path)?;
             let custom_reader = BufReader::new(custom_file);
             let custom_config: CustomConfig = serde_json::from_reader(custom_reader)?;
-            
+
             if let Some(new_max_pos) = custom_config.max_position_embeddings {
                 if new_max_pos > original_max_pos {
                     return Err(format!("max_position_embeddings ({}) no puede ser mayor que el límite físico del modelo ({})", new_max_pos, original_max_pos).into());
                 }
                 config.text_config.max_position_embeddings = new_max_pos;
-                println!("🔧 Override aplicado: max_position_embeddings reducido a {}", new_max_pos);
+                println!(
+                    "🔧 Override aplicado: max_position_embeddings reducido a {}",
+                    new_max_pos
+                );
             }
         }
-        
+
         println!("✅ Configuración estricta del LLM cargada correctamente.");
 
         // === FASE DE MEMORY MAPPING (mmap) ===
@@ -198,10 +216,40 @@ impl EnvelopeLlm {
         // Ordenarlos alfabéticamente para asegurar que se mapeen en orden (00001, 00002...)
         safetensor_files.sort();
 
-        // 2. Establecemos el dispositivo y la precisión
-        // Por autonomía e independencia, forzamos CPU. Gemma usa BF16 de forma nativa.
-        let device = Device::Cpu;
-        println!("⏳ Mapeando {} archivos safetensors (mmap) en memoria virtual...", safetensor_files.len());
+        // 2. Establecemos el dispositivo según el archivo envelope_config.json en el directorio de ejecución
+        let config_path = std::path::Path::new("envelope_config.json");
+        let server_config: ServerConfig = if config_path.exists() {
+            let config_data = fs::read_to_string(&config_path)?;
+            serde_json::from_str(&config_data).unwrap_or_default()
+        } else {
+            ServerConfig::default()
+        };
+
+        let device = match server_config.device_type.to_lowercase().as_str() {
+            "cuda" | "gpu" => {
+                println!("🚀 Intentando inicializar CUDA/GPU...");
+                Device::new_cuda(0).unwrap_or_else(|_| {
+                    println!("⚠️ Falló la inicialización de CUDA. Usando CPU como fallback.");
+                    Device::Cpu
+                })
+            },
+            "metal" => {
+                println!("🚀 Intentando inicializar Apple Metal...");
+                Device::new_metal(0).unwrap_or_else(|_| {
+                    println!("⚠️ Falló la inicialización de Metal. Usando CPU como fallback.");
+                    Device::Cpu
+                })
+            },
+            _ => {
+                println!("🚀 Usando CPU por defecto.");
+                Device::Cpu
+            }
+        };
+
+        println!(
+            "⏳ Mapeando {} archivos safetensors (mmap) en memoria virtual...",
+            safetensor_files.len()
+        );
 
         // 3. Crear el VarBuilder con memory mapping (unsafe porque el SO asume que nadie borrará los archivos mientras corre)
         let _vb = unsafe {
@@ -210,8 +258,14 @@ impl EnvelopeLlm {
 
         println!("🏗️ Instanciando red neuronal Gemma4Unified en RAM virtual...");
         // Pasamos _vb.pp("model.language_model") porque todos los tensores cuelgan de esa raíz.
-        let model = crate::neural_architecture::Gemma4Model::load(_vb.pp("model").pp("language_model"), &config.text_config, &device)?;
-        println!("✅ Memoria virtual mapeada y arquitectura ensamblada. El modelo está listo para inferir.");
+        let model = crate::neural_architecture::Gemma4Model::load(
+            _vb.pp("model").pp("language_model"),
+            &config.text_config,
+            &device,
+        )?;
+        println!(
+            "✅ Memoria virtual mapeada y arquitectura ensamblada. El modelo está listo para inferir."
+        );
 
         Ok(Self { config, model })
     }
@@ -227,8 +281,8 @@ impl EnvelopeLlm {
     where
         F: FnMut(u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        use candle_transformers::generation::LogitsProcessor;
         use candle_core::IndexOp;
+        use candle_transformers::generation::LogitsProcessor;
 
         // 1. Limpiar Caché KV de ejecuciones anteriores
         self.model.clear_kv_cache();
@@ -266,7 +320,7 @@ impl EnvelopeLlm {
 
             // Muestreo probabilístico (Temperature / Top-K integrados en el LogitsProcessor)
             let next_token = logits_processor.sample(&final_logits)?;
-            
+
             println!("[DEBUG] iter={}, next_token={}", index, next_token);
 
             tokens.push(next_token);
@@ -282,5 +336,3 @@ impl EnvelopeLlm {
         Ok(())
     }
 }
-
-

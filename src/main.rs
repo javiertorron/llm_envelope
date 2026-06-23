@@ -78,8 +78,11 @@ async fn main() {
                 break;
             }
             
+            // Plantilla obligatoria de Gemma para evitar alucinaciones
+            let formatted_prompt = format!("<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n", prompt);
+            
             println!("🤖 Respuesta:");
-            let prompt_tokens = match tokenizer.encode(prompt) {
+            let prompt_tokens = match tokenizer.encode(&formatted_prompt) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("Error al tokenizar: {}", e);

@@ -1,96 +1,94 @@
-# Candle LLM Inference Envelope (Gemma 4 12b) 🦀🚀
+# Candle LLM Inference Envelope
 
-Un motor y servidor de inferencia para Modelos de Lenguaje Grande (LLMs) empaquetado en un único ejecutable autónomo y portable, desarrollado 100% en Rust utilizando el framework **Candle** de Hugging Face. **Este envoltorio ha sido diseñado de manera estricta y exclusiva para el modelo Gemma 4 de 12b parámetros.**
+Este proyecto es un motor de inferencia nativo en Rust para modelos grandes de lenguaje (LLMs) como Gemma, diseñado para ser altamente portable, rápido y capaz de ejecutarse en distintos tipos de hardware (CPU, NVIDIA GPU o Apple Metal).
 
-## 📋 Descripción del Proyecto
+## Requisitos de Hardware y Dependencias
 
-Este proyecto redefine la distribución de modelos de Inteligencia Artificial mediante el patrón **Model-as-a-Service (MaaS)** en local. A diferencia de las soluciones genéricas, este envelope está fuertemente acoplado a la arquitectura de **Gemma 4 12b**, garantizando que cada campo de configuración del archivo JSON y cada tensor sean exactamente los esperados sin tolerar desviaciones. Compila todo el ciclo de vida de la inferencia (Tokenización, Carga de Tensores, Procesamiento de Matrices y Servidor API HTTP) dentro de un único binario nativo, optimizado, portable y sin dependencias dinámicas.
+Dependiendo del hardware que quieras utilizar para la aceleración gráfica (`device_type` en tu configuración), necesitarás tener instaladas distintas librerías en tu sistema operativo antes de poder compilar el proyecto.
 
-El desarrollo se aborda de forma incremental siguiendo una metodología **Agile orientada a Épicas e Hitos Atómicos**, minimizando la parálisis por análisis y garantizando la robustez de cada capa antes de exponerla a la red.
+### 1. Inferencia en CPU (Modo por defecto)
 
-## ✨ Características Principales
+El modo CPU garantiza la máxima portabilidad. Cuenta con un conversor dinámico `BF16` -> `F32` que permite a la CPU calcular tensores sin colapsar por incompatibilidades de tipo.
 
-- **Runtime 100% Nativo en Rust:** Construido sobre el ecosistema matemático de `candle-core` y `candle-transformers`.
-- **Exclusividad Gemma 4 12b:** Las estructuras de memoria, variables de `config.json` y operaciones de tensores se mapean milimétricamente al modelo objetivo, sin sobrecarga por abstracciones genéricas.
-- **Carga de Memoria Eficiente:** Uso de `Memory Mapping (mmap)` a través de `VarBuilder` para inicializar modelos binarios masivos de forma segura sin saturar la memoria RAM.
-- **Formato Safetensors:** Compatibilidad nativa con el estándar industrial seguro y veloz de Hugging Face (`.safetensors`).
-- **Arquitectura Asíncrona Extrema:** Servidor HTTP ligero basado en `Axum` y el runtime `Tokio`, diseñado para procesar peticiones en microsegundos y mantener un consumo de memoria plano y predecible.
-- **Generación en Streaming:** Implementación de Server-Sent Events (SSE) para la transmisión token-a-token (palabra por palabra) en tiempo real por red.
+- **Sistemas Soportados**: Linux, macOS, Windows.
+- **Dependencias**: Ninguna (Cero dependencias dinámicas).
+- **Compilación**:
 
-## ⚙️ Comportamiento y Ciclo de Vida
+  ```bash
+  cargo build --release
+  ```
 
-Al ejecutar el binario, el sistema realiza estrictamente las siguientes fases:
+### 2. Inferencia en GPU NVIDIA (CUDA)
 
-1. **Validación de Entorno:** Comprueba la existencia de `config.json`, `tokenizer.json` y `*.safetensors` en la ruta especificada.
-2. **Carga Inicial (Warm-up):** Parsea estrictamente la configuración (verificando que es un Gemma 4) e inicializa los pesos del modelo en memoria mediante `mmap` **antes** de abrir cualquier puerto de red.
-3. **Inicialización de Red:** Levanta el servicio HTTP en el puerto designado (por defecto `8080`).
-4. **Interfaz Silenciosa:** Reporta por `stdout` únicamente los hitos críticos (estado de la carga con timestamps, IP/puerto de escucha, y registro básico de peticiones procesadas).
+Para utilizar la VRAM y los núcleos CUDA de tu tarjeta gráfica NVIDIA, necesitas instalar el **NVIDIA CUDA Toolkit** en tu sistema. Esto proporcionará el compilador `nvcc` necesario para que Rust enlace con los drivers de tu tarjeta.
 
-## 🔌 Especificación de la API
+- **Sistemas Soportados**: Linux, Windows.
+- **Dependencias por Sistema Operativo**:
+  - **Ubuntu / Pop!_OS / Debian**:
 
-El servidor expone un endpoint compatible con el estándar de OpenAI para facilitar la integración con herramientas de la industria.
+    ```bash
+    sudo apt update && sudo apt install nvidia-cuda-toolkit -y
+    ```
 
-**Endpoint:** `POST /v1/chat/completions`
+  - **Fedora / RHEL**:
 
-**Estructura de la Petición:**
+    ```bash
+    sudo dnf install cuda
+    ```
+
+  - **Arch Linux / Manjaro**:
+
+    ```bash
+    sudo pacman -S cuda
+    ```
+
+  - **Windows**: Descarga el instalador del [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) y añádelo al PATH.
+- **Compilación**:
+
+  ```bash
+  cargo build --release --features cuda
+  ```
+
+### 3. Inferencia en Apple Silicon (Metal)
+
+Para ordenadores Mac con chips M1, M2, M3 o M4. Aprovecha la memoria unificada del sistema operativo macOS.
+
+- **Sistemas Soportados**: macOS.
+- **Dependencias**: Ninguna adicional (Metal Framework viene preinstalado en macOS).
+- **Compilación**:
+
+  ```bash
+  cargo build --release --features metal
+  ```
+
+---
+
+## Ejecución y Fichero de Configuración
+
+El ejecutable buscará en su misma ruta un archivo llamado `envelope_config.json` para determinar qué hardware inicializar.
+
+Crea un archivo `envelope_config.json` en la raíz de la aplicación:
 
 ```json
 {
-  "model": "gemma-4-12b",
-  "messages": [
-    {
-      "role": "user",
-      "content": "string"
-    }
-  ],
-  "temperature": 0.0,
-  "max_tokens": 50
+  "device_type": "cuda"
 }
 ```
 
-**Respuesta en Streaming (SSE):**
-Se transmite un flujo de eventos `text/event-stream` enviando tokens individuales en tiempo real, finalizando con la señal `[DONE]`:
+*Los valores permitidos para `device_type` son: `"cpu"`, `"cuda"`, o `"metal"`.*
 
-```json
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gemma-4-12b","choices":[{"index":0,"delta":{"content":"palabra"},"finish_reason":null}]}
-...
-data: [DONE]
-```
+### Modos de Arranque
 
-## 📦 Criterios de Portabilidad (El Binario Autónomo)
+1. **Modo Consola Interactiva**: Si lanzas el programa de forma estándar, se abrirá un chat en la terminal.
 
-El producto final garantiza un despliegue sin fricciones en entornos productivos:
+   ```bash
+   cargo run --release --features cuda -- --model /ruta/absoluta/a/los/pesos/del/modelo/
+   ```
 
-- **Cero Dependencias Dinámicas:** Compilación contra el target `x86_64-unknown-linux-musl` para incrustar la librería de C estáticamente en sistemas Linux.
-- **Tamaño Optimizado:** Uso de Link-Time Optimization (`lto = true`) en el perfil de producción para eliminar código muerto y reducir el tamaño binario generado por las librerías matemáticas.
-- **Autonomía:** Arranca en instalaciones Linux limpias requiriendo únicamente acceso de lectura a la carpeta de pesos del modelo.
+2. **Modo Servidor HTTP (OpenAI API)**: Si pasas el parámetro `--serve`, el sistema levantará un servidor asíncrono `Axum` en el puerto `8080` que responderá a peticiones HTTP mediante *Server-Sent Events* (SSE).
 
-## 🗺️ Mapa de Ruta de Ingeniería (Épicas)
+   ```bash
+   cargo run --release --features cuda -- --model /ruta/absoluta/a/los/pesos/del/modelo/ --serve
+   ```
 
-1. **Épica 1: El Motor en Consola (Inferencia Local):** Construcción del núcleo matemático de Candle acoplado a la arquitectura Gemma 4 y el bucle autorregresivo. El modelo carga desde el disco duro y genera texto directamente en la terminal (CLI puro).
-2. **Épica 2: El Servidor Rígido (API Síncrona):** Integración de la fachada de red con Axum. El modelo se aloja como estado compartido concurrente (`std::sync::Arc`) y responde peticiones HTTP POST.
-3. **Épica 3: El Servidor Fluido (API en Streaming):** Integración de canales asíncronos (`tokio::sync::mpsc`) para emitir la respuesta en tiempo real a través de flujos SSE.
-4. **Épica 4: El Binario Autónomo (Compilación Estática):** Aplicación de LTO y compilación `musl` para generar el ejecutable portable final.
-
-## 🛠️ Requisitos Previos
-
-- **Rust Toolchain:** Versión estable más reciente (`rustup update`).
-- **Archivos del Modelo Gemma 4 12b:**
-  - Archivo de vocabulario: `tokenizer.json` y `tokenizer_config.json`
-  - Archivo de hiperparámetros estrictos: `config.json`
-  - Pesos del modelo: `model.safetensors` (u otros nombres generados por safetensors)
-
-## 🚀 Progreso Actual e Instrucciones (Fase 1)
-
-**Hito Actual:**
-Se ha configurado la suite completa de dependencias matemáticas en el `Cargo.toml` (`candle-core`, `candle-nn`, `candle-transformers`, `candle-datasets`, `hf-hub`, `tokenizers`) y se ha validado la ejecución básica del motor de tensores (soporte de fallback a CPU configurado).
-
-Para probar el entorno de desarrollo:
-
-```Bash
-# Actualizar el compilador a su versión estable
-rustup update
-
-# Descargar dependencias, compilar y ejecutar prueba matemática básica
-cargo run
-```
+> **Nota de Resiliencia:** Si configuras el servidor para usar `cuda` o `metal` pero el hardware falla al inicializarse o los drivers están corruptos, el motor atrapará el error y realizará un **fallback automático a la CPU**, garantizando que el servicio web nunca se caiga durante el arranque.
