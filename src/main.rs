@@ -10,10 +10,6 @@ pub mod neural_architecture;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Candle LLM Inference Envelope")]
 struct Args {
-    /// Ruta absoluta al directorio del modelo (opcional)
-    #[arg(long = "model")]
-    model: Option<PathBuf>,
-
     /// Arranca el servidor HTTP en lugar de usar la consola interactiva
     #[arg(long = "serve", default_value_t = false)]
     serve: bool,
@@ -25,8 +21,19 @@ pub mod server;
 async fn main() {
     let args = Args::parse();
     
-    // Si pasaron el parámetro --model lo usamos, sino usamos "./model"
-    let base_path_buf = args.model.unwrap_or_else(|| PathBuf::from("./model"));
+    let server_config = llm::load_server_config();
+    
+    // === OPTIMIZACIÓN DE RENDIMIENTO CPU ===
+    // Configurar explícitamente Rayon para usar todos los núcleos lógicos, acelerando inferencia en CPU.
+    let num_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(num_cores).build_global() {
+        eprintln!("⚠️ No se pudo forzar el número de hilos de Rayon: {}", e);
+    } else {
+        println!("⚙️ Configuración del procesador: Habilitados {} hilos para computación neuronal.", num_cores);
+    }
+    
+    // Extraemos el path del modelo desde envelope_config.json, por defecto usamos "./model"
+    let base_path_buf = server_config.model.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("./model"));
     let base_path = base_path_buf.as_path();
 
     // Validamos el entorno del modelo (directorio y archivos)

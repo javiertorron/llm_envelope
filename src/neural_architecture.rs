@@ -1,46 +1,16 @@
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::{Module, VarBuilder};
+use candle_core::quantized::{QMatMul, QTensor};
+use candle_nn::Module;
+use std::collections::HashMap;
 use std::sync::Mutex;
+use crate::llm::{TextConfig, RopeAttentionConfig};
 
-/// Helper de multiplicación de matrices que soporta BF16 en CPU
-pub fn matmul_bf16(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    if a.dtype() == DType::BF16 && a.device().is_cpu() {
-        let a_f32 = a.to_dtype(DType::F32)?;
-        let b_f32 = b.to_dtype(DType::F32)?;
-        let res = a_f32.matmul(&b_f32)?;
-        res.to_dtype(DType::BF16)
-    } else {
-        a.matmul(b)
-    }
-}
-
-/// Envoltorio sobre candle_nn::Linear que usa matmul_bf16
-#[derive(Debug)]
-pub struct CpuLinear {
-    inner: candle_nn::Linear,
-}
-
-impl CpuLinear {
-    pub fn new(inner: candle_nn::Linear) -> Self {
-        Self { inner }
-    }
-    
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let w = self.inner.weight();
-        let w = match x.dims() {
-            &[bsize, _, _] => w.broadcast_left(bsize)?,
-            _ => w.clone(),
-        };
-        let mut out = matmul_bf16(x, &w.t()?)?;
-        if let Some(bias) = self.inner.bias() {
-            out = out.broadcast_add(bias)?;
-        }
-        Ok(out)
-    }
+/// Helper para extraer y consumir QTensor del mapa GGUF
+pub fn get_qtensor(tensors: &mut HashMap<String, QTensor>, name: &str) -> Result<QTensor> {
+    tensors.remove(name).ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {}", name)))
 }
 
 /// Normalización Root Mean Square (RMSNorm) exclusiva para la arquitectura Gemma.
-/// A diferencia del estándar, Gemma suma 1.0 a los pesos aprendidos de forma matemática.
 #[derive(Debug)]
 pub struct RmsNorm {
     weight: Tensor,
@@ -48,15 +18,14 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
-    pub fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        // En los safetensors de Gemma, estos pesos suelen llamarse "weight"
-        let weight = vb.get(size, "weight")?;
+    pub fn load(_size: usize, eps: f64, tensors: &mut HashMap<String, QTensor>, name: &str, device: &Device) -> Result<Self> {
+        let weight_q = get_qtensor(tensors, name)?;
+        let weight = weight_q.dequantize(device)?;
         Ok(Self { weight, eps })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x_dtype = x.dtype();
-        // Para mayor estabilidad numérica, elevamos la precisión a F32 para calcular la varianza.
         let internal_dtype = match x_dtype {
             DType::F16 | DType::BF16 => DType::F32,
             d => d,
@@ -67,18 +36,14 @@ impl RmsNorm {
         let x_normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let x_normed = x_normed.to_dtype(x_dtype)?;
         
-        // Peculiaridad de Gemma: (1.0 + weight)
         let weight_plus_one = (&self.weight + 1.0)?;
         x_normed.broadcast_mul(&weight_plus_one)
     }
 }
 
-/// Caché Key-Value para generación autorregresiva rápida.
-/// En vez de recalcular todo el contexto en cada token, guardamos los valores K y V de atención pasada.
+/// Caché Key-Value
 #[derive(Debug, Clone)]
 pub struct KVCache {
-    // Almacena el tensor de Keys y Values de la capa
-    // Dimensiones típicas: (batch_size, num_kv_heads, seq_len, head_dim)
     k: Option<Tensor>,
     v: Option<Tensor>,
 }
@@ -88,17 +53,14 @@ impl KVCache {
         Self { k: None, v: None }
     }
 
-    /// Limpia la caché para iniciar una nueva generación independiente
     pub fn clear(&mut self) {
         self.k = None;
         self.v = None;
     }
 
-    /// Actualiza la caché adjuntando (concatenando) los nuevos tensores K y V generados.
     pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
         match (&self.k, &self.v) {
             (Some(k_past), Some(v_past)) => {
-                // Dimensión 2 suele ser la longitud de secuencia (seq_len) en la arquitectura de atención
                 let k = Tensor::cat(&[k_past, new_k], 2)?;
                 let v = Tensor::cat(&[v_past, new_v], 2)?;
                 self.k = Some(k.clone());
@@ -106,7 +68,6 @@ impl KVCache {
                 Ok((k, v))
             }
             _ => {
-                // Es el primer token, por tanto la caché se inicializa con los tensores entrantes.
                 self.k = Some(new_k.clone());
                 self.v = Some(new_v.clone());
                 Ok((new_k.clone(), new_v.clone()))
@@ -114,10 +75,8 @@ impl KVCache {
         }
     }
 }
-use candle_nn::linear_no_bias;
-use crate::llm::{TextConfig, RopeAttentionConfig};
 
-/// RoPE (Rotary Position Embeddings)
+/// RoPE
 #[derive(Debug)]
 pub struct RotaryEmbedding {
     cos: Tensor,
@@ -136,7 +95,7 @@ impl RotaryEmbedding {
         let t: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
         let t = Tensor::from_vec(t, (max_seq_len,), device)?;
         let freqs = t.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
-        let freqs = Tensor::cat(&[&freqs, &freqs], 1)?; // (seq_len, dim)
+        let freqs = Tensor::cat(&[&freqs, &freqs], 1)?;
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let sin = freqs.sin()?.to_dtype(dtype)?;
         Ok(Self { cos, sin })
@@ -147,7 +106,7 @@ impl RotaryEmbedding {
         let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
         let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
         
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq_len, dim)
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
         
         let x1 = x.narrow(D::Minus1, 0, n_embd / 2)?;
@@ -160,28 +119,23 @@ impl RotaryEmbedding {
     }
 }
 
-/// Multi-Layer Perceptron (GemmaMLP)
 #[derive(Debug)]
 pub struct GemmaMlp {
-    gate_proj: CpuLinear,
-    up_proj: CpuLinear,
-    down_proj: CpuLinear,
+    gate_proj: QMatMul,
+    up_proj: QMatMul,
+    down_proj: QMatMul,
 }
 
 impl GemmaMlp {
-    pub fn load(vb: VarBuilder, config: &TextConfig) -> Result<Self> {
-        let hidden_size = config.hidden_size;
-        let intermediate_size = config.intermediate_size;
-        
-        let gate_proj = CpuLinear::new(candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?);
-        let up_proj = CpuLinear::new(candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?);
-        let down_proj = CpuLinear::new(candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?);
+    pub fn load(tensors: &mut HashMap<String, QTensor>, prefix: &str) -> Result<Self> {
+        let gate_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.ffn_gate.weight", prefix))?)?;
+        let up_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.ffn_up.weight", prefix))?)?;
+        let down_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.ffn_down.weight", prefix))?)?;
         Ok(Self { gate_proj, up_proj, down_proj })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
-        // Usamos la aproximación estándar de GELU (gelu_pytorch_tanh equivalente aprox en candle)
         let gate = candle_nn::Activation::NewGelu.forward(&gate)?;
         let up = self.up_proj.forward(x)?;
         let intermediate = (gate * up)?;
@@ -189,7 +143,6 @@ impl GemmaMlp {
     }
 }
 
-/// Helper para expandir las Key y Values en el algoritmo Grouped-Query Attention (GQA)
 fn repeat_kv(x: Tensor, num_key_value_groups: usize) -> Result<Tensor> {
     if num_key_value_groups == 1 {
         return Ok(x);
@@ -202,13 +155,12 @@ fn repeat_kv(x: Tensor, num_key_value_groups: usize) -> Result<Tensor> {
     Ok(x)
 }
 
-/// Capa de Atención (GemmaAttention) con soporte GQA, caché y ventana deslizante
 #[derive(Debug)]
 pub struct GemmaAttention {
-    q_proj: CpuLinear,
-    k_proj: CpuLinear,
-    v_proj: Option<CpuLinear>,
-    o_proj: CpuLinear,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: Option<QMatMul>,
+    o_proj: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -222,11 +174,12 @@ pub struct GemmaAttention {
 
 impl GemmaAttention {
     pub fn load(
-        vb: VarBuilder,
+        tensors: &mut HashMap<String, QTensor>,
+        prefix: &str,
         config: &TextConfig,
         is_sliding: bool,
+        device: &Device,
     ) -> Result<Self> {
-        let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         
         let (num_kv_heads, head_dim) = if is_sliding {
@@ -236,20 +189,19 @@ impl GemmaAttention {
         };
         let num_kv_groups = num_heads / num_kv_heads;
 
-        let q_proj = CpuLinear::new(linear_no_bias(hidden_size, num_heads * head_dim, vb.pp("q_proj"))?);
-        let k_proj = CpuLinear::new(linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("k_proj"))?);
+        let q_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_q.weight", prefix))?)?;
+        let k_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_k.weight", prefix))?)?;
         
-        // Si is_sliding, existe v_proj. Si no, K=V (attention_k_eq_v) y no hay v_proj.
-        let v_proj = if is_sliding {
-            Some(CpuLinear::new(linear_no_bias(hidden_size, num_kv_heads * head_dim, vb.pp("v_proj"))?))
+        let v_proj = if !config.attention_k_eq_v {
+            Some(QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_v.weight", prefix))?)?)
         } else {
             None
         };
         
-        let o_proj = CpuLinear::new(linear_no_bias(num_heads * head_dim, hidden_size, vb.pp("o_proj"))?);
+        let o_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_output.weight", prefix))?)?;
         
-        let q_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = RmsNorm::load(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_norm = RmsNorm::load(head_dim, config.rms_norm_eps, tensors, &format!("{}.attn_q_norm.weight", prefix), device)?;
+        let k_norm = RmsNorm::load(head_dim, config.rms_norm_eps, tensors, &format!("{}.attn_k_norm.weight", prefix), device)?;
 
         Ok(Self {
             q_proj,
@@ -268,25 +220,17 @@ impl GemmaAttention {
         })
     }
 
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        rotary_emb: &RotaryEmbedding,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, rotary_emb: &RotaryEmbedding, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _hidden_size) = x.dims3()?;
 
-        // 1. Proyecciones iniciales (Q, K, V)
         let query_states = self.q_proj.forward(x)?;
         let key_states = self.k_proj.forward(x)?;
         
-        // K = V si v_proj no existe (attention_k_eq_v para full_attention)
         let value_states = match &self.v_proj {
             Some(vp) => vp.forward(x)?,
             None => key_states.clone(),
         };
 
-        // 2. Reformatear para atención y normalizar por cabezal (b_sz, seq_len, num_heads, head_dim)
         let query_states = query_states.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
         
@@ -297,25 +241,24 @@ impl GemmaAttention {
             .reshape((b_sz, seq_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Aplicar los Rotational Embeddings (RoPE)
         let query_states = rotary_emb.forward(&query_states, seqlen_offset)?;
         let key_states = rotary_emb.forward(&key_states, seqlen_offset)?;
 
-        // 4. Actualizar y recuperar Caché
         let (key_states, value_states) = {
             let mut cache = self.kv_cache.lock().unwrap();
             cache.append(&key_states, &value_states)?
         };
 
-        // 5. Expandir K y V si es necesario (Grouped Query Attention)
         let key_states = repeat_kv(key_states, self.num_kv_groups)?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?;
 
-        // 6. Dot-product attention pura
         let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let attn_weights = (crate::neural_architecture::matmul_bf16(&query_states, &key_states.transpose(2, 3)?)? * scale)?;
+        let mut attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
 
-        // 7. Enmascaramiento condicional (sólo para prompt processing o ventanas grandes)
+        // Attention Logit Softcapping (Gemma 2+ uses 50.0)
+        let softcap = 50.0;
+        attn_weights = ((attn_weights / softcap)?.tanh()? * softcap)?;
+
         let attn_weights = if seq_len > 1 {
             let mask = self.get_causal_mask(seq_len, seqlen_offset, key_states.dim(2)?, x.dtype(), x.device())?;
             let attn_weights = attn_weights.broadcast_add(&mask)?;
@@ -324,13 +267,11 @@ impl GemmaAttention {
             candle_nn::ops::softmax(&attn_weights, D::Minus1)?
         };
 
-        // 8. Multiplicar por V y ensamblar
-        let attn_output = crate::neural_architecture::matmul_bf16(&attn_weights, &value_states)?;
+        let attn_output = attn_weights.matmul(&value_states)?;
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
 
-        // 9. Proyección de salida
         self.o_proj.forward(&attn_output)
     }
 
@@ -358,7 +299,6 @@ impl GemmaAttention {
     }
 }
 
-/// Capa Completa del Decodificador (Atención + MLP + RMSNorms)
 #[derive(Debug)]
 pub struct DecoderLayer {
     self_attn: GemmaAttention,
@@ -371,17 +311,18 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    pub fn load(vb: VarBuilder, config: &TextConfig, is_sliding: bool) -> Result<Self> {
-        let self_attn = GemmaAttention::load(vb.pp("self_attn"), config, is_sliding)?;
-        let mlp = GemmaMlp::load(vb.pp("mlp"), config)?;
-        let input_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let post_attention_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
+    pub fn load(tensors: &mut HashMap<String, QTensor>, prefix: &str, config: &TextConfig, is_sliding: bool, device: &Device) -> Result<Self> {
+        let self_attn = GemmaAttention::load(tensors, prefix, config, is_sliding, device)?;
+        let mlp = GemmaMlp::load(tensors, prefix)?;
         
-        let pre_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("pre_feedforward_layernorm"))?;
-        let post_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("post_feedforward_layernorm"))?;
+        let input_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, tensors, &format!("{}.attn_norm.weight", prefix), device)?;
+        let post_attention_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, tensors, &format!("{}.post_attention_norm.weight", prefix), device)?;
         
-        // layer_scalar se encuentra en algunas arquitecturas como gemma4/2
-        let layer_scalar = vb.get(1, "layer_scalar").ok();
+        let pre_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, tensors, &format!("{}.ffn_norm.weight", prefix), device)?;
+        let post_feedforward_layernorm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, tensors, &format!("{}.post_ffw_norm.weight", prefix), device)?;
+        
+        let layer_scalar = get_qtensor(tensors, &format!("{}.layer_output_scale.weight", prefix))
+            .and_then(|qt| qt.dequantize(device)).ok();
         
         Ok(Self { 
             self_attn, mlp, input_layernorm, post_attention_layernorm, 
@@ -416,8 +357,6 @@ impl DecoderLayer {
     }
 }
 
-/// El Modelo Gemma 4 Completo (End-to-End)
-#[derive(Debug)]
 pub struct Gemma4Model {
     pub embed_tokens: candle_nn::Embedding,
     pub layers: Vec<DecoderLayer>,
@@ -427,29 +366,30 @@ pub struct Gemma4Model {
 }
 
 impl Gemma4Model {
-    pub fn load(vb: VarBuilder, config: &TextConfig, device: &Device) -> Result<Self> {
-        let embed_tokens = candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+    pub fn load(tensors: &mut HashMap<String, QTensor>, config: &TextConfig, device: &Device) -> Result<Self> {
+        let embed_q = get_qtensor(tensors, "token_embd.weight")?;
+        let embed_t = embed_q.dequantize(device)?;
+        let embed_tokens = candle_nn::Embedding::new(embed_t, config.hidden_size);
         
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
-            // El array layer_types intercala "sliding_attention" y "full_attention"
             let is_sliding = config.layer_types
                 .get(layer_idx)
                 .map(|s| s == "sliding_attention")
                 .unwrap_or(false);
                 
-            let layer = DecoderLayer::load(vb.pp(&format!("layers.{}", layer_idx)), config, is_sliding)?;
+            let prefix = format!("blk.{}", layer_idx);
+            let layer = DecoderLayer::load(tensors, &prefix, config, is_sliding, device)?;
             layers.push(layer);
         }
         
-        let norm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
+        let norm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, tensors, "output_norm.weight", device)?;
         
-        // Las instancias de RoPE se comparten entre capas del mismo tipo para ahorrar RAM
         let rotary_emb_full = RotaryEmbedding::new(
-            DType::BF16, device, config.global_head_dim, config.max_position_embeddings, &config.rope_parameters.full_attention
+            DType::F32, device, config.global_head_dim, config.max_position_embeddings, &config.rope_parameters.full_attention
         )?;
         let rotary_emb_sliding = RotaryEmbedding::new(
-            DType::BF16, device, config.head_dim, config.max_position_embeddings, &config.rope_parameters.sliding_attention
+            DType::F32, device, config.head_dim, config.max_position_embeddings, &config.rope_parameters.sliding_attention
         )?;
         
         Ok(Self { embed_tokens, layers, norm, rotary_emb_full, rotary_emb_sliding })
@@ -459,8 +399,6 @@ impl Gemma4Model {
         let mut x = self.embed_tokens.forward(input_ids)?;
         let hidden_size = x.dim(D::Minus1)?;
         
-        // Escalar los embeddings: x = x * sqrt(hidden_size)
-        // Secreto matemático de Gemma para dar peso al embedding original frente a las capas profundas
         x = (x * (hidden_size as f64).sqrt())?;
         
         for layer in self.layers.iter() {
@@ -475,20 +413,18 @@ impl Gemma4Model {
         self.norm.forward(&x)
     }
 
-    /// Limpia el estado de la caché KV para preparar al modelo para un nuevo prompt
     pub fn clear_kv_cache(&self) {
         for layer in &self.layers {
             layer.clear_kv_cache();
         }
     }
 
-    /// Proyecta el hidden state final en logits usando los pesos del embedding original (tie_word_embeddings = true)
     pub fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let embeddings = self.embed_tokens.embeddings();
         let w = match hidden_states.dims() {
             &[bsize, _, _] => embeddings.broadcast_left(bsize)?,
             _ => embeddings.clone(),
         };
-        crate::neural_architecture::matmul_bf16(hidden_states, &w.t()?)
+        hidden_states.matmul(&w.t()?)
     }
 }

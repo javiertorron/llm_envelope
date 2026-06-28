@@ -6,14 +6,28 @@ use std::io::BufReader;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub device_type: String,
+    pub model: Option<String>,
+    pub gguf: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             device_type: "cpu".to_string(),
+            model: None,
+            gguf: None,
         }
     }
+}
+
+pub fn load_server_config() -> ServerConfig {
+    let config_path = std::path::Path::new("envelope_config.json");
+    if config_path.exists() {
+        if let Ok(config_data) = fs::read_to_string(&config_path) {
+            return serde_json::from_str(&config_data).unwrap_or_default();
+        }
+    }
+    ServerConfig::default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,29 +206,6 @@ impl EnvelopeLlm {
         println!("✅ Configuración estricta del LLM cargada correctamente.");
 
         // === FASE DE MEMORY MAPPING (mmap) ===
-        use candle_core::{DType, Device};
-        use candle_nn::VarBuilder;
-        use std::path::PathBuf;
-
-        // 1. Recolectar todos los archivos .safetensors en el directorio
-        let mut safetensor_files: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(base_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "safetensors" {
-                        safetensor_files.push(path);
-                    }
-                }
-            }
-        }
-
-        if safetensor_files.is_empty() {
-            return Err("No se encontraron archivos .safetensors en el directorio base.".into());
-        }
-        // Ordenarlos alfabéticamente para asegurar que se mapeen en orden (00001, 00002...)
-        safetensor_files.sort();
 
         // 2. Establecemos el dispositivo según el archivo envelope_config.json en el directorio de ejecución
         let config_path = std::path::Path::new("envelope_config.json");
@@ -228,44 +219,49 @@ impl EnvelopeLlm {
         let device = match server_config.device_type.to_lowercase().as_str() {
             "cuda" | "gpu" => {
                 println!("🚀 Intentando inicializar CUDA/GPU...");
-                Device::new_cuda(0).unwrap_or_else(|_| {
-                    println!("⚠️ Falló la inicialización de CUDA. Usando CPU como fallback.");
-                    Device::Cpu
+                candle_core::Device::new_cuda(0).unwrap_or_else(|e| {
+                    println!("⚠️ Falló la inicialización de CUDA: {:?}. Usando CPU como fallback.", e);
+                    candle_core::Device::Cpu
                 })
             },
             "metal" => {
                 println!("🚀 Intentando inicializar Apple Metal...");
-                Device::new_metal(0).unwrap_or_else(|_| {
+                candle_core::Device::new_metal(0).unwrap_or_else(|_| {
                     println!("⚠️ Falló la inicialización de Metal. Usando CPU como fallback.");
-                    Device::Cpu
+                    candle_core::Device::Cpu
                 })
             },
             _ => {
                 println!("🚀 Usando CPU por defecto.");
-                Device::Cpu
+                candle_core::Device::Cpu
             }
         };
 
-        println!(
-            "⏳ Mapeando {} archivos safetensors (mmap) en memoria virtual...",
-            safetensor_files.len()
-        );
+        let gguf_filename = server_config.gguf.unwrap_or_else(|| "model.gguf".to_string());
+        let gguf_path = base_path.join(gguf_filename);
 
-        // 3. Crear el VarBuilder con memory mapping (unsafe porque el SO asume que nadie borrará los archivos mientras corre)
-        let _vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&safetensor_files, DType::BF16, &device)?
-        };
+        println!("⏳ Mapeando archivo GGUF: {:?}...", gguf_path);
+        let mut file = std::fs::File::open(&gguf_path).map_err(|e| format!("Error al abrir GGUF: {}", e))?;
 
-        println!("🏗️ Instanciando red neuronal Gemma4Unified en RAM virtual...");
-        // Pasamos _vb.pp("model.language_model") porque todos los tensores cuelgan de esa raíz.
+        // Leemos la estructura del GGUF
+        use candle_core::quantized::gguf_file;
+        let content = gguf_file::Content::read(&mut file).map_err(|e| format!("Error parseando GGUF: {}", e))?;
+
+        let mut q_tensors = HashMap::new();
+        for (tensor_name, _info) in content.tensor_infos.iter() {
+            if let Ok(qtensor) = content.tensor(&mut file, tensor_name, &device) {
+                q_tensors.insert(tensor_name.clone(), qtensor);
+            }
+        }
+
+        println!("🏗️ Instanciando red neuronal Gemma4 Cuantizada (QMatMul)...");
         let model = crate::neural_architecture::Gemma4Model::load(
-            _vb.pp("model").pp("language_model"),
+            &mut q_tensors,
             &config.text_config,
             &device,
         )?;
-        println!(
-            "✅ Memoria virtual mapeada y arquitectura ensamblada. El modelo está listo para inferir."
-        );
+        
+        println!("✅ GGUF cargado exitosamente en dispositivo: {:?}", device);
 
         Ok(Self { config, model })
     }
@@ -288,7 +284,8 @@ impl EnvelopeLlm {
         self.model.clear_kv_cache();
 
         let device = &candle_core::Device::Cpu;
-        let mut logits_processor = LogitsProcessor::new(299792458, Some(temperature), None);
+        let temp = if temperature < 1e-7 { None } else { Some(temperature) };
+        let mut logits_processor = LogitsProcessor::new(299792458, temp, None);
 
         let mut tokens = prompt_tokens.to_vec();
 
