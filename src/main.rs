@@ -85,26 +85,32 @@ async fn main() {
                 break;
             }
             
-            // Plantilla obligatoria de Gemma para evitar alucinaciones
-            let formatted_prompt = format!("<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n", prompt);
-            
             println!("🤖 Respuesta:");
-            let prompt_tokens = match tokenizer.encode(&formatted_prompt) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Error al tokenizar: {}", e);
-                    continue;
-                }
-            };
+            let user_prefix_tokens = tokenizer.encode("user\n").unwrap_or_default();
+            let prompt_content_tokens = tokenizer.encode(prompt).unwrap_or_default();
+            let eot_newline_tokens = tokenizer.encode("\n").unwrap_or_default();
+            let model_prefix_tokens = tokenizer.encode("model\n").unwrap_or_default();
             
-            // max_tokens = 512 por defecto en consola, con temperatura estándar
-            let _ = llm.generate(&prompt_tokens, 0.7, 512, |token_id| {
+            let mut prompt_tokens = Vec::new();
+            prompt_tokens.push(2); // <bos>
+            prompt_tokens.push(105); // <|turn|>
+            prompt_tokens.extend_from_slice(&user_prefix_tokens[1..]); // omit bos if included by encode
+            prompt_tokens.extend_from_slice(&prompt_content_tokens[1..]);
+            prompt_tokens.push(106); // <turn|>
+            prompt_tokens.extend_from_slice(&eot_newline_tokens[1..]);
+            prompt_tokens.push(105); // <|turn|>
+            prompt_tokens.extend_from_slice(&model_prefix_tokens[1..]);
+
+            println!("DEBUG: prompt_tokens len: {}, tokens: {:?}", prompt_tokens.len(), prompt_tokens);
+                if let Err(e) = llm.generate(&prompt_tokens, 0.7, 512, |token_id| {
                 if let Ok(text) = tokenizer.decode(&[token_id]) {
                     print!("{}", text);
                     io::stdout().flush().unwrap();
                 }
                 Ok(())
-            });
+            }) {
+                eprintln!("Error durante la generación: {}", e);
+            }
             
             println!();
             

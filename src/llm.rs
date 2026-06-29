@@ -68,6 +68,10 @@ pub struct RopeParameters {
     pub sliding_attention: RopeAttentionConfig,
 }
 
+fn default_attn_logit_softcapping() -> Option<f64> {
+    Some(50.0)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextConfig {
@@ -77,6 +81,8 @@ pub struct TextConfig {
     pub bos_token_id: u32,
     pub enable_moe_block: bool,
     pub eos_token_id: u32,
+    #[serde(default = "default_attn_logit_softcapping", alias = "attention_logit_cap")]
+    pub attn_logit_softcapping: Option<f64>,
     pub final_logit_softcapping: f64,
     pub global_head_dim: usize,
     pub head_dim: usize,

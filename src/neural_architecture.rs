@@ -36,8 +36,7 @@ impl RmsNorm {
         let x_normed = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let x_normed = x_normed.to_dtype(x_dtype)?;
         
-        let weight_plus_one = (&self.weight + 1.0)?;
-        x_normed.broadcast_mul(&weight_plus_one)
+        x_normed.broadcast_mul(&self.weight)
     }
 }
 
@@ -87,9 +86,19 @@ impl RotaryEmbedding {
     pub fn new(dtype: DType, device: &Device, dim: usize, max_seq_len: usize, config: &RopeAttentionConfig) -> Result<Self> {
         let base = config.rope_theta;
         let mut inv_freq: Vec<f32> = Vec::new();
-        for i in (0..dim).step_by(2) {
+
+        let partial_factor = config.partial_rotary_factor.unwrap_or(1.0);
+        let rope_angles = (dim as f64 * partial_factor) as usize / 2;
+
+        for i in (0..(rope_angles * 2)).step_by(2) {
             inv_freq.push(1.0 / base.powf(i as f64 / dim as f64) as f32);
         }
+
+        let nope_angles = (dim / 2).saturating_sub(rope_angles);
+        for _ in 0..nope_angles {
+            inv_freq.push(0.0);
+        }
+
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (inv_freq_len,), device)?;
         let t: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
@@ -169,6 +178,7 @@ pub struct GemmaAttention {
     head_dim: usize,
     is_sliding: bool,
     sliding_window: usize,
+    attn_logit_softcapping: Option<f64>,
     kv_cache: Mutex<KVCache>,
 }
 
@@ -180,28 +190,34 @@ impl GemmaAttention {
         is_sliding: bool,
         device: &Device,
     ) -> Result<Self> {
-        let num_heads = config.num_attention_heads;
-        
-        let (num_kv_heads, head_dim) = if is_sliding {
-            (config.num_key_value_heads, config.head_dim)
-        } else {
-            (config.num_global_key_value_heads, config.global_head_dim)
-        };
-        let num_kv_groups = num_heads / num_kv_heads;
-
         let q_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_q.weight", prefix))?)?;
         let k_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_k.weight", prefix))?)?;
         
-        let v_proj = if !config.attention_k_eq_v {
-            Some(QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_v.weight", prefix))?)?)
-        } else {
-            None
+        let v_proj = match tensors.remove(&format!("{}.attn_v.weight", prefix)) {
+            Some(qt) => Some(QMatMul::from_qtensor(qt)?),
+            None => None,
         };
         
         let o_proj = QMatMul::from_qtensor(get_qtensor(tensors, &format!("{}.attn_output.weight", prefix))?)?;
         
+        let head_dim = if !is_sliding && config.global_head_dim > 0 {
+            config.global_head_dim
+        } else {
+            config.head_dim
+        };
+
         let q_norm = RmsNorm::load(head_dim, config.rms_norm_eps, tensors, &format!("{}.attn_q_norm.weight", prefix), device)?;
         let k_norm = RmsNorm::load(head_dim, config.rms_norm_eps, tensors, &format!("{}.attn_k_norm.weight", prefix), device)?;
+
+        let use_alternative_attention = config.attention_k_eq_v && !is_sliding;
+        let num_kv_heads = if use_alternative_attention {
+            config.num_global_key_value_heads
+        } else {
+            config.num_key_value_heads
+        };
+
+        let num_heads = config.num_attention_heads;
+        let num_kv_groups = num_heads / num_kv_heads;
 
         Ok(Self {
             q_proj,
@@ -216,6 +232,7 @@ impl GemmaAttention {
             head_dim,
             is_sliding,
             sliding_window: config.sliding_window,
+            attn_logit_softcapping: config.attn_logit_softcapping,
             kv_cache: Mutex::new(KVCache::new()),
         })
     }
@@ -252,12 +269,15 @@ impl GemmaAttention {
         let key_states = repeat_kv(key_states, self.num_kv_groups)?;
         let value_states = repeat_kv(value_states, self.num_kv_groups)?;
 
-        let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let mut attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+        let mut attn_weights = query_states.matmul(&key_states.transpose(2, 3)?)?;
 
-        // Attention Logit Softcapping (Gemma 2+ uses 50.0)
-        let softcap = 50.0;
-        attn_weights = ((attn_weights / softcap)?.tanh()? * softcap)?;
+        // Attention Scaling
+        attn_weights = (attn_weights / (self.head_dim as f64).sqrt())?;
+        
+        // Attention Softcapping (Gemma4 specific)
+        if let Some(softcap) = self.attn_logit_softcapping {
+            attn_weights = ((attn_weights / softcap)?.tanh()? * softcap)?;
+        }
 
         let attn_weights = if seq_len > 1 {
             let mask = self.get_causal_mask(seq_len, seqlen_offset, key_states.dim(2)?, x.dtype(), x.device())?;
@@ -401,7 +421,8 @@ impl Gemma4Model {
         
         x = (x * (hidden_size as f64).sqrt())?;
         
-        for layer in self.layers.iter() {
+        for (i, layer) in self.layers.iter().enumerate() {
+            println!("[DEBUG] Ejecutando capa {}", i);
             let rotary_emb = if layer.self_attn.is_sliding {
                 &self.rotary_emb_sliding
             } else {
@@ -421,10 +442,22 @@ impl Gemma4Model {
 
     pub fn lm_head(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let embeddings = self.embed_tokens.embeddings();
-        let w = match hidden_states.dims() {
-            &[bsize, _, _] => embeddings.broadcast_left(bsize)?,
-            _ => embeddings.clone(),
+        // hidden_states can be [batch, seq_len, hidden_size] or [batch, hidden_size]
+        
+        let logits = if hidden_states.rank() == 3 {
+            // [batch, seq_len, hidden_size]
+            let hidden_states = hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?; // [batch, 1, hidden_size]
+            let w = embeddings.broadcast_left(hidden_states.dim(0)?)?; // [batch, vocab_size, hidden_size]
+            hidden_states.matmul(&w.t()?)?.squeeze(1)? // [batch, vocab_size]
+        } else {
+            // [batch, hidden_size]
+            hidden_states.matmul(&embeddings.t()?)? // [batch, vocab_size]
         };
-        hidden_states.matmul(&w.t()?)
+        
+        // Final Logit Softcapping
+        let softcap = 30.0;
+        let mut logits = ((logits / softcap)?.tanh()? * softcap)?;
+        
+        Ok(logits)
     }
 }
